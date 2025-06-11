@@ -1,0 +1,46 @@
+name: Test DHI Migration Tool
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: [3.8, 3.9, '3.10', 3.11]
+
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v3
+      with:
+        python-version: ${{ matrix.python-version }}
+    
+    - name: Test migration tool
+      run: |
+        chmod +x dhi_migrate.py
+        
+        # Test dry run on examples
+        python dhi_migrate.py examples/node-app/Dockerfile.original myorg/dhi-node:18-dev --dry-run
+        python dhi_migrate.py examples/python-app/Dockerfile.original myorg/dhi-python:3.11-dev --dry-run
+        python dhi_migrate.py examples/go-app/Dockerfile.original myorg/dhi-golang:1.21-dev --dry-run
+        
+        echo "✅ All tests passed"
+    
+    - name: Validate generated Dockerfiles
+      run: |
+        # Basic syntax validation
+        for dockerfile in test-results/*.dockerfile; do
+          if [ -f "$dockerfile" ]; then
+            echo "Validating $dockerfile..."
+            # Basic checks for required DHI patterns
+            grep -q "FROM.*dhi-" "$dockerfile" || (echo "❌ Missing DHI base image" && exit 1)
+            grep -q "nonroot" "$dockerfile" || echo "⚠️  No nonroot user found"
+          fi
+        done
+        echo "✅ Dockerfile validation passed"
