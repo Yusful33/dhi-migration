@@ -26,7 +26,7 @@ jobs:
         chmod +x dhi_migrate.py
         
         # Test dry run on examples
-        python dhi_migrate.py examples/node-app/Dockerfile.original myorg/dhi-node:18-dev --dry-run
+        python dhi_migrate.py examples/node-app/Dockerfile.original demonstrationorg/dhi-node:20.19.2-alpine3.21-dev --dry-run
         
         echo "✅ All tests passed"
     
