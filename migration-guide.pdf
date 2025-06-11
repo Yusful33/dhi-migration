@@ -1,0 +1,176 @@
+# Docker migration best practices: Official to hardened images
+
+Docker hardened images provide critical security improvements through reduced attack surfaces, non-root execution, and minimal dependencies. This research reveals the key patterns, tools, and strategies needed for successful migrations from Docker Official Images to their hardened counterparts.
+
+## Common Dockerfile patterns requiring modification
+
+The most significant changes when migrating to hardened images involve base image selection, user configuration, and package management. Traditional Dockerfiles often run as root by default and include unnecessary system utilities. Hardened images require explicit non-root user configuration with numeric UIDs (≥1000) for compatibility with container orchestration platforms.
+
+A typical migration transforms this pattern:
+```dockerfile
+FROM node:18
+COPY . /app
+WORKDIR /app
+RUN npm install
+CMD ["node", "server.js"]
+```
+
+Into a hardened equivalent:
+```dockerfile
+FROM cgr.dev/chainguard/node:latest-dev AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --omit=dev
+
+FROM cgr.dev/chainguard/node:latest
+RUN addgroup -g 1001 -S appgroup && \
+    adduser -u 1001 -S appuser -G appgroup
+COPY --from=builder --chown=appuser:appgroup /app /app
+WORKDIR /app
+USER 1001
+CMD ["node", "server.js"]
+```
+
+## Port mapping considerations for non-root users
+
+Non-root containers face restrictions binding to privileged ports below 1024. Three primary solutions address this challenge:
+
+**CAP_NET_BIND_SERVICE capability** allows non-root users to bind privileged ports while maintaining security. In Docker Compose:
+```yaml
+services:
+  web:
+    cap_add:
+      - NET_BIND_SERVICE
+    user: "1000:1000"
+    ports:
+      - "80:80"
+```
+
+**Port remapping** offers the simplest approach - running applications on unprivileged ports (8080) while mapping to privileged ports (80) at the host level. Alternatively, modifying the kernel parameter `net.ipv4.ip_unprivileged_port_start=0` allows all ports for non-root users, though this reduces security isolation.
+
+## File permission handling strategies
+
+Migrating from root to non-root users requires careful permission management. The `--chown` flag in COPY instructions efficiently sets ownership during the build process:
+```dockerfile
+COPY --chown=1000:1000 app.py /app/
+```
+
+For writable directories, explicit ownership must be set before switching users:
+```dockerfile
+RUN mkdir -p /app/logs /app/tmp && \
+    chown -R appuser:appgroup /app/logs /app/tmp
+USER appuser
+```
+
+Volume permissions present unique challenges. Named volumes default to root ownership, requiring initialization strategies. Pre-creating directories with correct ownership before the VOLUME declaration ensures proper permissions persist. For bind mounts, host directory ownership must match the container user ID.
+
+## Multi-stage build patterns with hardened images
+
+Multi-stage builds become essential for hardened images, separating build dependencies from minimal runtime environments. This pattern reduces attack surface while maintaining build flexibility:
+
+```dockerfile
+# Build stage with full toolchain
+FROM python:3.11-slim AS builder
+ENV PYTHONDONTWRITEBYTECODE=1
+RUN pip install pipenv
+COPY Pipfile* ./
+RUN PIPENV_VENV_IN_PROJECT=1 pipenv install --deploy
+
+# Runtime stage with distroless base
+FROM gcr.io/distroless/python3-debian12
+WORKDIR /app
+COPY --from=builder /.venv/lib/python3.11/site-packages /app/site-packages
+ENV PYTHONPATH=/app/site-packages
+COPY --chown=nonroot:nonroot . .
+USER nonroot
+CMD ["main.py"]
+```
+
+This approach keeps build tools, package managers, and development dependencies out of production images while ensuring all runtime requirements are met.
+
+## Package installation for minimal hardened images
+
+Distroless and minimal hardened images lack package managers, requiring all dependencies to be installed during build stages. Static binary compilation eliminates runtime dependencies entirely:
+
+```dockerfile
+FROM golang:1.24 AS build
+WORKDIR /src
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -ldflags='-w -s -extldflags "-static"' \
+    -o app .
+
+FROM scratch
+COPY --from=build /src/app /app
+ENTRYPOINT ["/app"]
+```
+
+For interpreted languages, dependencies must be copied from build stages. Alpine-based hardened images provide minimal package management through apk, while distroless images require all dependencies to be pre-installed and copied.
+
+## Entry point and command differences
+
+Hardened images require explicit executable forms for ENTRYPOINT and CMD instructions to ensure proper signal handling:
+```dockerfile
+# Correct: exec form
+CMD ["node", "server.js"]
+
+# Incorrect: shell form (won't receive signals properly)
+CMD node server.js
+```
+
+Signal handling becomes critical as applications often run as PID 1. Using init systems like tini ensures proper process reaping and signal forwarding:
+```dockerfile
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["node", "server.js"]
+```
+
+## Existing tools and scripts for migration
+
+The research identified several powerful tools for automated Dockerfile transformation:
+
+**dockerfile-parse** (Python) provides programmatic Dockerfile manipulation capabilities, allowing structured parsing and modification while preserving formatting. It serves as an excellent foundation for migration scripts.
+
+**Hadolint** offers comprehensive Dockerfile linting with 60+ security and best practice rules. Its rule-based approach and AST parsing make it valuable for both validation and transformation guidance.
+
+**ast-grep** enables pattern-based code transformations using AST matching, supporting Dockerfile syntax. Its YAML-based rule configuration provides a flexible framework for defining migration patterns.
+
+For enterprise environments, Docker Scout and specialized registries like Chainguard provide pre-hardened images with built-in security scanning and minimal CVE exposure.
+
+## Best practices for automated transformation
+
+Successful automated Dockerfile transformation requires a systematic approach:
+
+1. **Rule-based transformation engine**: Define migration patterns in YAML configuration files, similar to Hadolint's approach
+2. **AST preservation**: Use tools that maintain Dockerfile structure while applying transformations
+3. **Validation pipeline**: Integrate pre and post-transformation security scanning
+4. **Incremental migration**: Transform services individually rather than entire applications
+5. **Rollback capability**: Maintain version control and automated rollback mechanisms
+
+A Python migration script should leverage dockerfile-parse for parsing, implement transformation rules inspired by ast-grep patterns, and validate results through Hadolint integration.
+
+## Common troubleshooting scenarios
+
+Permission denied errors represent the most frequent migration challenge. Applications fail to write logs or create temporary files when running as non-root. Solutions include pre-creating directories with proper ownership, using init containers for runtime permission fixes, or mounting writable volumes at specific paths.
+
+Missing system dependencies cause startup failures in distroless images. Applications expecting shells, package managers, or system utilities fail immediately. Multi-stage builds that copy only required binaries address this issue.
+
+Signal handling problems manifest as containers taking excessive time to stop or failing to perform cleanup. Using exec form for ENTRYPOINT/CMD and implementing proper signal handlers in application code resolves these issues.
+
+Network connectivity issues arise from missing DNS configuration or dropped capabilities. Adding explicit DNS servers and preserving necessary network capabilities ensures proper connectivity.
+
+Volume permission mismatches between host and container users require careful UID/GID alignment. Using consistent numeric IDs across environments and proper volume initialization prevents access issues.
+
+## Migration implementation strategy
+
+A comprehensive Python migration script should implement these capabilities:
+
+1. Parse Dockerfiles using dockerfile-parse to extract structure
+2. Apply transformation rules based on detected patterns
+3. Generate hardened Dockerfile variants with security best practices
+4. Validate transformed files using Hadolint
+5. Support batch processing for multiple Dockerfiles
+6. Provide detailed migration reports and rollback options
+
+The migration process benefits from incremental adoption, starting with stateless services before tackling stateful applications. Comprehensive testing in staging environments matching production configurations ensures smooth transitions.
+
+This research provides the foundation for building robust automated migration tools that transform Docker Official Images to hardened alternatives while maintaining application functionality and improving security posture.
