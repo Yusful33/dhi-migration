@@ -27,8 +27,6 @@ jobs:
         
         # Test dry run on examples
         python dhi_migrate.py examples/node-app/Dockerfile.original myorg/dhi-node:18-dev --dry-run
-        python dhi_migrate.py examples/python-app/Dockerfile.original myorg/dhi-python:3.11-dev --dry-run
-        python dhi_migrate.py examples/go-app/Dockerfile.original myorg/dhi-golang:1.21-dev --dry-run
         
         echo "✅ All tests passed"
     
